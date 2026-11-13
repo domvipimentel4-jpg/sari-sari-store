@@ -1,55 +1,79 @@
-import { useEffect, useState } from "react";
+import { useFocusEffect } from "expo-router";
+import { useCallback, useState } from "react";
 import {
-    Pressable,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    View,
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
 } from "react-native";
 
 import AddModal from "@/components/add-modal";
 import AppHeader from "@/components/app-header";
+import LoadingScreen from "@/components/loading-screen";
 import { Brand, Spacing } from "@/constants/theme";
 import { getCurrentAccount } from "@/lib/auth";
 import { peso } from "@/lib/format";
-import { loadList, saveList } from "@/lib/store-data";
+import {
+  hasShownLoading,
+  markLoadingShown,
+  withMinimumLoading,
+} from "@/lib/loading";
+import { useInventoryStore } from "@/store/useInventoryStore";
 
-type Item = {
-  id: number;
-  name: string;
-  stock: number;
-  unit: string;
-  price: number;
-  tag: string;
-  category: string;
-};
+type ActionKind = "restock" | "sell" | "delete";
 
 const LOW_STOCK = 8;
 
 export default function InventoryScreen() {
-  const [items, setItems] = useState<Item[]>([]);
-  const [loaded, setLoaded] = useState(false);
+  // Shared state from Zustand (replaces the old useState + loadList/saveList)
+  const items = useInventoryStore((s) => s.items);
+  const load = useInventoryStore((s) => s.load);
+  const addProduct = useInventoryStore((s) => s.addItem);
+  const removeItem = useInventoryStore((s) => s.removeItem);
+  const restock = useInventoryStore((s) => s.restock);
+  const sell = useInventoryStore((s) => s.sell);
+
+  // Local UI state stays in the component
+  const [ready, setReady] = useState(() => hasShownLoading("inventory")); // true after the first load
   const [showAdd, setShowAdd] = useState(false);
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("All");
   const [storeName, setStoreName] = useState("Your Store");
 
-  // Load saved items and the registered store name when the screen opens
-  useEffect(() => {
-    loadList<Item>("items").then((list) => {
-      setItems(list);
-      setLoaded(true);
-    });
-    getCurrentAccount().then((account) => {
-      if (account) setStoreName(account.storeName);
-    });
-  }, []);
+  // Restock / Sell / Delete popup
+  const [action, setAction] = useState<{ type: ActionKind; id: number } | null>(
+    null,
+  );
+  const [qty, setQty] = useState("1");
+  const [actionError, setActionError] = useState("");
 
-  // Save every time items change
-  useEffect(() => {
-    if (loaded) saveList("items", items);
-  }, [items, loaded]);
+  // Reload every time this screen opens, so a different account never sees old data.
+  // The first time, the loading screen stays for at least 5 seconds.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+
+      // Load the store data and the store name at the same time
+      const work = Promise.all([load(), getCurrentAccount().catch(() => null)]);
+      const request = hasShownLoading("inventory")
+        ? work
+        : withMinimumLoading(work);
+
+      request.then(([, account]) => {
+        if (!active) return;
+        if (account) setStoreName(account.storeName);
+        markLoadingShown("inventory");
+        setReady(true);
+      });
+
+      return () => {
+        active = false;
+      };
+    }, [load]),
+  );
 
   // Categories now come from your items
   const categories = [
@@ -65,48 +89,60 @@ export default function InventoryScreen() {
     if (isNaN(price) || price < 0) return "Enter a valid price.";
     if (isNaN(stock) || stock < 0) return "Enter a valid stock number.";
 
-    setItems((prev) => [
-      ...prev,
-      {
-        id: Date.now(),
-        name: v.name.trim(),
-        price,
-        stock,
-        unit: v.unit?.trim() || "pcs",
-        category: v.category?.trim() || "Others",
-        tag: v.tag?.trim() || "",
-      },
-    ]);
+    addProduct({
+      name: v.name.trim(),
+      price,
+      stock,
+      category: v.category?.trim() || "Others",
+    });
     return null;
   }
 
-  async function recordSale(amount: number) {
-    const list = await loadList<{ id: number; amount: number; date: string }>(
-      "sales",
-    );
-    await saveList("sales", [
-      ...list,
-      { id: Date.now(), amount, date: new Date().toDateString() },
-    ]);
+  function openAction(type: ActionKind, id: number) {
+    setAction({ type, id });
+    setQty("1");
+    setActionError("");
   }
 
-  function changeStock(id: number, amount: number) {
-    const target = items.find((i) => i.id === id);
-    if (!target) return;
+  function closeAction() {
+    setAction(null);
+    setActionError("");
+  }
 
-    // Selling: only counts if there is stock left
-    if (amount < 0) {
-      if (target.stock === 0) return;
-      recordSale(target.price);
+  function confirmAction() {
+    if (!action) return;
+
+    const target = items.find((i) => i.id === action.id);
+    if (!target) {
+      closeAction();
+      return;
     }
 
-    setItems((prev) =>
-      prev.map((item) =>
-        item.id === id
-          ? { ...item, stock: Math.max(0, item.stock + amount) }
-          : item,
-      ),
-    );
+    // Delete the product
+    if (action.type === "delete") {
+      removeItem(target.id);
+      closeAction();
+      return;
+    }
+
+    // Restock or sell: use the typed quantity
+    const amount = parseInt(qty, 10);
+    if (isNaN(amount) || amount < 1) {
+      setActionError("Enter a quantity of 1 or more.");
+      return;
+    }
+
+    if (action.type === "sell") {
+      if (amount > target.stock) {
+        setActionError(`Only ${target.stock} left in stock.`);
+        return;
+      }
+      sell(target.id, amount); // updates stock and records the sale
+    } else {
+      restock(target.id, amount);
+    }
+
+    closeAction();
   }
 
   const shown = items.filter(
@@ -119,6 +155,29 @@ export default function InventoryScreen() {
     (sum, item) => sum + item.stock * item.price,
     0,
   );
+
+  // Details for the popup
+  const actionTarget = action
+    ? items.find((i) => i.id === action.id)
+    : undefined;
+  const typedQty = parseInt(qty, 10);
+  const previewTotal =
+    actionTarget && !isNaN(typedQty) && typedQty > 0
+      ? typedQty * actionTarget.price
+      : 0;
+
+  let dialogTitle = "";
+  if (action && actionTarget) {
+    if (action.type === "delete") dialogTitle = `Delete ${actionTarget.name}?`;
+    else if (action.type === "restock")
+      dialogTitle = `Restock ${actionTarget.name}`;
+    else dialogTitle = `Sell ${actionTarget.name}`;
+  }
+
+  // Loading screen: shown until the products and store name arrive
+  if (!ready) {
+    return <LoadingScreen title="Inventory" message="Loading inventory..." />;
+  }
 
   return (
     <View style={styles.screen}>
@@ -199,28 +258,37 @@ export default function InventoryScreen() {
             </View>
 
             <View style={styles.stockRow}>
-              <Text style={styles.stockText}>
-                Stock: {item.stock} {item.unit}
-              </Text>
+              <Text style={styles.stockText}>Stock: {item.stock}</Text>
               {item.stock <= LOW_STOCK && (
                 <View style={styles.lowBadge}>
                   <Text style={styles.lowBadgeText}>Low Stock</Text>
                 </View>
               )}
+              <Pressable
+                style={styles.deleteButton}
+                onPress={() => openAction("delete", item.id)}
+              >
+                <Text style={styles.deleteText}>Delete</Text>
+              </Pressable>
             </View>
 
             <View style={styles.cardBottom}>
-              <Text style={styles.tagText}>{item.tag}</Text>
               <View style={styles.buttonRow}>
                 <Pressable
                   style={[styles.smallButton, styles.restock]}
-                  onPress={() => changeStock(item.id, 1)}
+                  onPress={() => openAction("restock", item.id)}
                 >
                   <Text style={styles.smallButtonText}>+ Restock</Text>
                 </Pressable>
                 <Pressable
-                  style={[styles.smallButton, styles.sell]}
-                  onPress={() => changeStock(item.id, -1)}
+                  style={[
+                    styles.smallButton,
+                    styles.sell,
+                    item.stock === 0 && styles.buttonDisabled,
+                  ]}
+                  onPress={() => {
+                    if (item.stock > 0) openAction("sell", item.id);
+                  }}
                 >
                   <Text style={styles.smallButtonText}>- Sell</Text>
                 </Pressable>
@@ -257,11 +325,83 @@ export default function InventoryScreen() {
             placeholder: "e.g. 12",
             numeric: true,
           },
-          { key: "unit", label: "Unit", placeholder: "pcs, bottles, sachets" },
           { key: "category", label: "Category", placeholder: "e.g. Drinks" },
-          { key: "tag", label: "Note (optional)", placeholder: "e.g. Chilled" },
         ]}
       />
+
+      <Modal
+        visible={action !== null && actionTarget !== undefined}
+        transparent
+        animationType="fade"
+        onRequestClose={closeAction}
+      >
+        <View style={styles.overlay}>
+          <View style={styles.dialog}>
+            <Text style={styles.dialogTitle}>{dialogTitle}</Text>
+
+            {action?.type === "delete" ? (
+              <Text style={styles.dialogText}>
+                This removes the product from your inventory. This cannot be
+                undone.
+              </Text>
+            ) : (
+              <>
+                <Text style={styles.dialogText}>
+                  Current stock: {actionTarget?.stock}
+                </Text>
+                <Text style={styles.dialogLabel}>Quantity</Text>
+                <TextInput
+                  style={styles.qtyInput}
+                  keyboardType="number-pad"
+                  value={qty}
+                  autoFocus
+                  selectTextOnFocus
+                  onChangeText={(t) => {
+                    setQty(t.replace(/\D/g, ""));
+                    setActionError("");
+                  }}
+                  onSubmitEditing={confirmAction}
+                />
+                {action?.type === "sell" && previewTotal > 0 ? (
+                  <Text style={styles.dialogText}>
+                    Total: {peso(previewTotal)}
+                  </Text>
+                ) : null}
+              </>
+            )}
+
+            {actionError ? (
+              <Text style={styles.dialogError}>{actionError}</Text>
+            ) : null}
+
+            <View style={styles.dialogButtons}>
+              <Pressable
+                style={[styles.dialogButton, styles.cancelButton]}
+                onPress={closeAction}
+              >
+                <Text style={styles.cancelText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.dialogButton,
+                  action?.type === "restock"
+                    ? styles.confirmGreen
+                    : styles.confirmRed,
+                ]}
+                onPress={confirmAction}
+              >
+                <Text style={styles.confirmText}>
+                  {action?.type === "delete"
+                    ? "Delete"
+                    : action?.type === "restock"
+                      ? "Add Stock"
+                      : "Confirm Sale"}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -422,14 +562,20 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "700",
   },
+  deleteButton: {
+    marginLeft: "auto",
+    paddingVertical: 2,
+    paddingHorizontal: Spacing.two,
+  },
+  deleteText: {
+    color: Brand.dangerText,
+    fontSize: 12,
+    fontWeight: "700",
+  },
   cardBottom: {
     flexDirection: "row",
-    justifyContent: "space-between",
+    justifyContent: "flex-end",
     alignItems: "center",
-  },
-  tagText: {
-    fontSize: 11,
-    color: Brand.textMuted,
   },
   buttonRow: {
     flexDirection: "row",
@@ -445,6 +591,9 @@ const styles = StyleSheet.create({
   },
   sell: {
     backgroundColor: Brand.primary,
+  },
+  buttonDisabled: {
+    opacity: 0.4,
   },
   smallButtonText: {
     color: Brand.primaryText,
@@ -467,5 +616,79 @@ const styles = StyleSheet.create({
     color: Brand.primaryText,
     fontSize: 28,
     lineHeight: 30,
+  },
+  overlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: Spacing.four,
+  },
+  dialog: {
+    width: "100%",
+    maxWidth: 360,
+    backgroundColor: Brand.card,
+    borderRadius: 20,
+    padding: Spacing.four,
+    gap: Spacing.two,
+  },
+  dialogTitle: {
+    fontSize: 17,
+    fontWeight: "700",
+    color: Brand.text,
+  },
+  dialogText: {
+    fontSize: 13,
+    color: Brand.textMuted,
+  },
+  dialogLabel: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: Brand.text,
+    marginTop: Spacing.two,
+  },
+  qtyInput: {
+    backgroundColor: Brand.inputBg,
+    borderRadius: 12,
+    height: 48,
+    paddingHorizontal: Spacing.three,
+    fontSize: 16,
+    color: Brand.text,
+    ...({ outlineStyle: "none" } as object),
+  },
+  dialogError: {
+    color: "#C0392B",
+    fontSize: 12,
+  },
+  dialogButtons: {
+    flexDirection: "row",
+    gap: Spacing.two,
+    marginTop: Spacing.three,
+  },
+  dialogButton: {
+    flex: 1,
+    height: 46,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  cancelButton: {
+    backgroundColor: Brand.inputBg,
+  },
+  cancelText: {
+    color: Brand.text,
+    fontWeight: "600",
+    fontSize: 14,
+  },
+  confirmRed: {
+    backgroundColor: Brand.primary,
+  },
+  confirmGreen: {
+    backgroundColor: Brand.success,
+  },
+  confirmText: {
+    color: Brand.primaryText,
+    fontWeight: "700",
+    fontSize: 14,
   },
 });

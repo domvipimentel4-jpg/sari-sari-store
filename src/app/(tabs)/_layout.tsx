@@ -17,8 +17,18 @@ export default function TabsLayout() {
         },
       }}
     >
-      <Tabs.Screen name="inventory" options={{ title: "Inventory" }} />
-      <Tabs.Screen name="credit" options={{ title: "Credit" }} />
+      <Tabs.Screen
+        name="dashboard"
+        options={{ title: "Sari-sari Store", tabBarLabel: "Dashboard" }}
+      />
+      <Tabs.Screen
+        name="inventory"
+        options={{ title: "Sari-sari Store", tabBarLabel: "Inventory" }}
+      />
+      <Tabs.Screen
+        name="credit"
+        options={{ title: "Sari-sari Store", tabBarLabel: "Credit" }}
+      />
     </Tabs>
   );
 }

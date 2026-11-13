@@ -1,49 +1,94 @@
-import { useEffect, useState } from "react";
+import { useFocusEffect } from "expo-router";
+import { useCallback, useState } from "react";
 import {
-    Pressable,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    View,
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
 } from "react-native";
 
 import AddModal from "@/components/add-modal";
 import AppHeader from "@/components/app-header";
+import LoadingScreen from "@/components/loading-screen";
 import { Brand, Spacing } from "@/constants/theme";
 import { peso } from "@/lib/format";
-import { loadList, saveList } from "@/lib/store-data";
+import {
+  hasShownLoading,
+  markLoadingShown,
+  withMinimumLoading,
+} from "@/lib/loading";
+import { useCreditStore } from "@/store/useCreditStore";
 
-type Customer = {
-  id: number;
-  name: string;
-  last: string;
-  tag: string;
-  balance: number;
-  avatarBg: string;
-  tagBg: string;
-  tagText: string;
-};
+type ActionKind = "pay" | "utang" | "delete";
+
+function round2(n: number) {
+  return Math.round(n * 100) / 100;
+}
+
+function formatWhen(iso: string) {
+  return new Date(iso).toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+// Keeps only digits and one decimal point
+function cleanAmount(text: string) {
+  const cleaned = text.replace(/[^0-9.]/g, "");
+  const parts = cleaned.split(".");
+  if (parts.length <= 2) return cleaned;
+  return parts[0] + "." + parts.slice(1).join("");
+}
 
 export default function CreditScreen() {
-  const [customers, setCustomers] = useState<Customer[]>([]);
-  const [loaded, setLoaded] = useState(false);
+  // Shared state from Zustand (replaces the old useState + loadList/saveList)
+  const customers = useCreditStore((s) => s.customers);
+  const load = useCreditStore((s) => s.load);
+  const addCustomerToStore = useCreditStore((s) => s.addCustomer);
+  const removeCustomer = useCreditStore((s) => s.removeCustomer);
+  const recordPayment = useCreditStore((s) => s.recordPayment);
+  const addUtang = useCreditStore((s) => s.addUtang);
+
+  // Local UI state stays in the component
+  const [ready, setReady] = useState(() => hasShownLoading("credit"));
   const [showAdd, setShowAdd] = useState(false);
-  const [paidToday, setPaidToday] = useState(0);
   const [search, setSearch] = useState("");
+  const [historyId, setHistoryId] = useState<number | null>(null);
 
-  // Load saved customers when the screen opens
-  useEffect(() => {
-    loadList<Customer>("customers").then((list) => {
-      setCustomers(list);
-      setLoaded(true);
-    });
-  }, []);
+  // Pay / Add utang / Delete popup
+  const [action, setAction] = useState<{ type: ActionKind; id: number } | null>(
+    null,
+  );
+  const [amountText, setAmountText] = useState("");
+  const [noteText, setNoteText] = useState("");
+  const [actionError, setActionError] = useState("");
 
-  // Save every time customers change
-  useEffect(() => {
-    if (loaded) saveList("customers", customers);
-  }, [customers, loaded]);
+  // Reload every time this screen opens, so a different account never sees old data
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+
+      const work = load();
+      const request = hasShownLoading("credit")
+        ? work
+        : withMinimumLoading(work);
+
+      request.then(() => {
+        if (!active) return;
+        markLoadingShown("credit");
+        setReady(true);
+      });
+
+      return () => {
+        active = false;
+      };
+    }, [load]),
+  );
 
   async function addCustomer(v: Record<string, string>) {
     const balance = parseFloat(v.balance || "0");
@@ -51,20 +96,65 @@ export default function CreditScreen() {
     if (!v.name?.trim()) return "Enter the customer's name.";
     if (isNaN(balance) || balance < 0) return "Enter a valid balance.";
 
-    setCustomers((prev) => [
-      ...prev,
-      {
-        id: Date.now(),
-        name: v.name.trim(),
-        last: "Added today",
-        tag: "New",
-        balance,
-        avatarBg: "#F9D5D3",
-        tagBg: Brand.badgeBg,
-        tagText: Brand.badgeText,
-      },
-    ]);
+    addCustomerToStore(v.name.trim(), balance);
     return null;
+  }
+
+  function openAction(type: ActionKind, id: number) {
+    setAction({ type, id });
+    setAmountText("");
+    setNoteText("");
+    setActionError("");
+  }
+
+  function closeAction() {
+    setAction(null);
+    setActionError("");
+  }
+
+  function closeHistory() {
+    setHistoryId(null);
+  }
+
+  function confirmAction() {
+    if (!action) return;
+
+    const target = customers.find((c) => c.id === action.id);
+    if (!target) {
+      closeAction();
+      return;
+    }
+
+    // Delete a customer (only offered when fully paid)
+    if (action.type === "delete") {
+      removeCustomer(target.id);
+      closeAction();
+      return;
+    }
+
+    const amount = round2(parseFloat(amountText));
+    if (isNaN(amount) || amount <= 0) {
+      setActionError("Enter an amount greater than 0.");
+      return;
+    }
+
+    if (action.type === "pay") {
+      if (amount > target.balance) {
+        setActionError(`Balance is only ${peso(target.balance)}.`);
+        return;
+      }
+      recordPayment(target.id, amount);
+    } else {
+      addUtang(target.id, amount, noteText.trim());
+    }
+
+    closeAction();
+  }
+
+  if (!ready) {
+    return (
+      <LoadingScreen title="Credit Ledger" message="Loading customers..." />
+    );
   }
 
   const month = new Date().toLocaleDateString("en-US", {
@@ -74,19 +164,48 @@ export default function CreditScreen() {
 
   const total = customers.reduce((sum, c) => sum + c.balance, 0);
 
+  // Paid Today = every payment recorded today, across all customers
+  const todayString = new Date().toDateString();
+  const paidToday = customers
+    .flatMap((c) => c.history ?? [])
+    .filter(
+      (h) =>
+        h.type === "payment" && new Date(h.at).toDateString() === todayString,
+    )
+    .reduce((sum, h) => sum + h.amount, 0);
+
   const shown = customers.filter((c) =>
     c.name.toLowerCase().includes(search.toLowerCase()),
   );
 
-  function markReceived(id: number) {
-    const person = customers.find((c) => c.id === id);
-    if (!person || person.balance === 0) return;
+  // Details for the Pay / Add utang / Delete popup
+  const actionTarget = action
+    ? customers.find((c) => c.id === action.id)
+    : undefined;
+  const typedAmount = parseFloat(amountText);
+  const validAmount = !isNaN(typedAmount) && typedAmount > 0;
 
-    setPaidToday(paidToday + person.balance);
-    setCustomers(
-      customers.map((c) => (c.id === id ? { ...c, balance: 0 } : c)),
-    );
+  let dialogTitle = "";
+  if (action && actionTarget) {
+    if (action.type === "delete") dialogTitle = `Delete ${actionTarget.name}?`;
+    else if (action.type === "pay")
+      dialogTitle = `Payment from ${actionTarget.name}`;
+    else dialogTitle = `Add utang for ${actionTarget.name}`;
   }
+
+  let preview = "";
+  if (action && actionTarget && validAmount) {
+    if (action.type === "pay" && typedAmount <= actionTarget.balance) {
+      preview = `Remaining balance: ${peso(round2(actionTarget.balance - typedAmount))}`;
+    } else if (action.type === "utang") {
+      preview = `New balance: ${peso(round2(actionTarget.balance + typedAmount))}`;
+    }
+  }
+
+  // Details for the History popup
+  const historyTarget =
+    historyId !== null ? customers.find((c) => c.id === historyId) : undefined;
+  const historyList = historyTarget?.history ?? [];
 
   return (
     <View style={styles.screen}>
@@ -139,44 +258,86 @@ export default function CreditScreen() {
           </Text>
         )}
 
-        {shown.map((c) => (
-          <View key={c.id} style={styles.card}>
-            <View style={styles.cardTop}>
-              <View style={[styles.avatar, { backgroundColor: c.avatarBg }]}>
-                <Text style={styles.avatarText}>{c.name[0]}</Text>
-              </View>
-              <View style={styles.nameCol}>
-                <Text style={styles.name} numberOfLines={1}>
-                  {c.name}
-                </Text>
-                <Text style={styles.last}>{c.last}</Text>
-              </View>
-              <View style={[styles.tagBadge, { backgroundColor: c.tagBg }]}>
-                <Text style={[styles.tagBadgeText, { color: c.tagText }]}>
-                  {c.tag}
-                </Text>
-              </View>
-            </View>
+        {shown.map((c) => {
+          const isPaid = c.balance === 0;
+          const historyCount = (c.history ?? []).length;
 
-            <View style={styles.cardBottom}>
+          return (
+            <View key={c.id} style={styles.card}>
+              <View style={styles.cardTop}>
+                <View style={[styles.avatar, { backgroundColor: c.avatarBg }]}>
+                  <Text style={styles.avatarText}>{c.name[0]}</Text>
+                </View>
+                <View style={styles.nameCol}>
+                  <Text style={styles.name} numberOfLines={1}>
+                    {c.name}
+                  </Text>
+                  <Text style={styles.last}>{c.last}</Text>
+                </View>
+                <View
+                  style={[
+                    styles.tagBadge,
+                    {
+                      backgroundColor: isPaid
+                        ? Brand.accentGreen
+                        : Brand.badgeBg,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.tagBadgeText,
+                      {
+                        color: isPaid ? Brand.accentGreenText : Brand.badgeText,
+                      },
+                    ]}
+                  >
+                    {isPaid ? "Paid" : "Has Utang"}
+                  </Text>
+                </View>
+              </View>
+
               <View>
                 <Text style={styles.balanceLabel}>BALANCE</Text>
                 <Text style={styles.balance}>{peso(c.balance)}</Text>
               </View>
-              <Pressable
-                style={[
-                  styles.receivedButton,
-                  c.balance === 0 && styles.receivedDone,
-                ]}
-                onPress={() => markReceived(c.id)}
-              >
-                <Text style={styles.receivedText}>
-                  {c.balance === 0 ? "Paid" : "Received"}
-                </Text>
-              </Pressable>
+
+              <View style={styles.actionRow}>
+                <Pressable
+                  style={[
+                    styles.actionButton,
+                    styles.payButton,
+                    isPaid && styles.buttonDisabled,
+                  ]}
+                  onPress={() => {
+                    if (!isPaid) openAction("pay", c.id);
+                  }}
+                >
+                  <Text style={styles.actionText}>Pay</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.actionButton, styles.utangButton]}
+                  onPress={() => openAction("utang", c.id)}
+                >
+                  <Text style={styles.actionText}>+ Add Utang</Text>
+                </Pressable>
+              </View>
+
+              <View style={styles.linkRow}>
+                <Pressable onPress={() => setHistoryId(c.id)}>
+                  <Text style={styles.linkText}>
+                    View history ({historyCount})
+                  </Text>
+                </Pressable>
+                {isPaid && (
+                  <Pressable onPress={() => openAction("delete", c.id)}>
+                    <Text style={styles.deleteText}>Delete</Text>
+                  </Pressable>
+                )}
+              </View>
             </View>
-          </View>
-        ))}
+          );
+        })}
 
         <View style={styles.tipCard}>
           <Text style={styles.tipLabel}>TRUST & COMMUNITY</Text>
@@ -210,6 +371,185 @@ export default function CreditScreen() {
           },
         ]}
       />
+
+      {/* Pay / Add utang / Delete popup */}
+      <Modal
+        visible={action !== null && actionTarget !== undefined}
+        transparent
+        animationType="fade"
+        onRequestClose={closeAction}
+      >
+        <View style={styles.overlay}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={closeAction} />
+          <View style={styles.dialog}>
+            <Text style={styles.dialogTitle}>{dialogTitle}</Text>
+
+            {action?.type === "delete" ? (
+              <Text style={styles.dialogText}>
+                This removes the customer and their history. This cannot be
+                undone.
+              </Text>
+            ) : (
+              <>
+                <Text style={styles.dialogText}>
+                  Current balance: {peso(actionTarget?.balance ?? 0)}
+                </Text>
+
+                <Text style={styles.dialogLabel}>Amount (₱)</Text>
+                <TextInput
+                  style={styles.dialogInput}
+                  keyboardType="decimal-pad"
+                  placeholder="e.g. 50"
+                  placeholderTextColor={Brand.textMuted}
+                  value={amountText}
+                  autoFocus
+                  onChangeText={(t) => {
+                    setAmountText(cleanAmount(t));
+                    setActionError("");
+                  }}
+                  onSubmitEditing={confirmAction}
+                />
+
+                {action?.type === "pay" && (actionTarget?.balance ?? 0) > 0 ? (
+                  <Pressable
+                    onPress={() => {
+                      setAmountText(String(actionTarget?.balance ?? ""));
+                      setActionError("");
+                    }}
+                  >
+                    <Text style={styles.linkText}>Pay full balance</Text>
+                  </Pressable>
+                ) : null}
+
+                {action?.type === "utang" ? (
+                  <>
+                    <Text style={styles.dialogLabel}>Note (optional)</Text>
+                    <TextInput
+                      style={styles.dialogInput}
+                      placeholder="e.g. 2 Coke, 1 noodles"
+                      placeholderTextColor={Brand.textMuted}
+                      value={noteText}
+                      onChangeText={setNoteText}
+                    />
+                  </>
+                ) : null}
+
+                {preview ? (
+                  <Text style={styles.dialogText}>{preview}</Text>
+                ) : null}
+              </>
+            )}
+
+            {actionError ? (
+              <Text style={styles.dialogError}>{actionError}</Text>
+            ) : null}
+
+            <View style={styles.dialogButtons}>
+              <Pressable
+                style={[styles.dialogButton, styles.cancelButton]}
+                onPress={closeAction}
+              >
+                <Text style={styles.cancelText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.dialogButton,
+                  action?.type === "pay"
+                    ? styles.confirmGreen
+                    : styles.confirmRed,
+                ]}
+                onPress={confirmAction}
+              >
+                <Text style={styles.confirmText}>
+                  {action?.type === "delete"
+                    ? "Delete"
+                    : action?.type === "pay"
+                      ? "Record Payment"
+                      : "Add Utang"}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* History popup */}
+      <Modal
+        visible={historyTarget !== undefined}
+        transparent
+        animationType="fade"
+        onRequestClose={closeHistory}
+      >
+        <View style={styles.overlay}>
+          {/* Tap the dark area outside the popup to close it */}
+          <Pressable style={StyleSheet.absoluteFill} onPress={closeHistory} />
+
+          <View style={[styles.dialog, styles.historyDialog]}>
+            <View style={styles.historyHeader}>
+              <Text style={styles.historyTitle} numberOfLines={1}>
+                {historyTarget?.name}&apos;s History
+              </Text>
+              <Pressable
+                style={styles.closeX}
+                onPress={closeHistory}
+                hitSlop={10}
+              >
+                <Text style={styles.closeXText}>✕</Text>
+              </Pressable>
+            </View>
+
+            <Text style={styles.dialogText}>
+              Current balance: {peso(historyTarget?.balance ?? 0)}
+            </Text>
+
+            <ScrollView
+              style={styles.historyScroll}
+              contentContainerStyle={styles.historyList}
+              showsVerticalScrollIndicator
+            >
+              {historyList.length === 0 ? (
+                <Text style={styles.historyEmpty}>No history yet.</Text>
+              ) : (
+                [...historyList].reverse().map((h) => (
+                  <View key={h.id} style={styles.historyRow}>
+                    <View style={styles.historyLeft}>
+                      <Text style={styles.historyType}>
+                        {h.type === "payment" ? "Payment" : "Utang added"}
+                      </Text>
+                      <Text style={styles.historyDate}>
+                        {formatWhen(h.at)}
+                        {h.note ? ` • ${h.note}` : ""}
+                      </Text>
+                    </View>
+                    <Text
+                      style={[
+                        styles.historyAmount,
+                        h.type === "payment"
+                          ? styles.amountPaid
+                          : styles.amountUtang,
+                      ]}
+                    >
+                      {h.type === "payment" ? "-" : "+"}
+                      {peso(h.amount)}
+                    </Text>
+                  </View>
+                ))
+              )}
+            </ScrollView>
+
+            <Pressable
+              style={[
+                styles.dialogButton,
+                styles.confirmRed,
+                styles.closeButton,
+              ]}
+              onPress={closeHistory}
+            >
+              <Text style={styles.confirmText}>Close</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -339,11 +679,6 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "700",
   },
-  cardBottom: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
   balanceLabel: {
     fontSize: 10,
     fontWeight: "700",
@@ -354,19 +689,122 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: Brand.primary,
   },
-  receivedButton: {
-    backgroundColor: Brand.success,
+  actionRow: {
+    flexDirection: "row",
+    gap: Spacing.two,
+  },
+  actionButton: {
+    flex: 1,
     borderRadius: 12,
-    paddingHorizontal: Spacing.four,
     paddingVertical: Spacing.three,
+    alignItems: "center",
   },
-  receivedDone: {
-    backgroundColor: Brand.textMuted,
+  payButton: {
+    backgroundColor: Brand.success,
   },
-  receivedText: {
+  utangButton: {
+    backgroundColor: Brand.primary,
+  },
+  buttonDisabled: {
+    opacity: 0.4,
+  },
+  actionText: {
     color: Brand.primaryText,
     fontWeight: "700",
     fontSize: 13,
+  },
+  linkRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  linkText: {
+    color: Brand.link,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  deleteText: {
+    color: Brand.dangerText,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  historyDialog: {
+    maxHeight: "85%",
+  },
+  historyHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: Spacing.two,
+  },
+  historyTitle: {
+    flex: 1,
+    fontSize: 17,
+    fontWeight: "700",
+    color: Brand.text,
+  },
+  closeX: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: Brand.inputBg,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  closeXText: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: Brand.text,
+  },
+  historyScroll: {
+    flexGrow: 0,
+    flexShrink: 1,
+    backgroundColor: Brand.inputBg,
+    borderRadius: 12,
+    marginTop: Spacing.two,
+  },
+  historyList: {
+    padding: Spacing.three,
+    gap: Spacing.three,
+  },
+  historyEmpty: {
+    fontSize: 12,
+    color: Brand.textMuted,
+  },
+  historyRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: Spacing.two,
+  },
+  historyLeft: {
+    flex: 1,
+  },
+  historyType: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: Brand.text,
+  },
+  historyDate: {
+    fontSize: 11,
+    color: Brand.textMuted,
+    marginTop: 2,
+  },
+  historyAmount: {
+    fontSize: 14,
+    fontWeight: "700",
+    flexShrink: 1,
+  },
+  amountPaid: {
+    color: Brand.success,
+  },
+  amountUtang: {
+    color: Brand.primary,
+  },
+  closeButton: {
+    flex: 0,
+    flexShrink: 0,
+    marginTop: Spacing.three,
   },
   tipCard: {
     backgroundColor: Brand.inputBg,
@@ -399,5 +837,79 @@ const styles = StyleSheet.create({
     color: Brand.primaryText,
     fontSize: 28,
     lineHeight: 30,
+  },
+  overlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: Spacing.four,
+  },
+  dialog: {
+    width: "100%",
+    maxWidth: 360,
+    backgroundColor: Brand.card,
+    borderRadius: 20,
+    padding: Spacing.four,
+    gap: Spacing.two,
+  },
+  dialogTitle: {
+    fontSize: 17,
+    fontWeight: "700",
+    color: Brand.text,
+  },
+  dialogText: {
+    fontSize: 13,
+    color: Brand.textMuted,
+  },
+  dialogLabel: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: Brand.text,
+    marginTop: Spacing.two,
+  },
+  dialogInput: {
+    backgroundColor: Brand.inputBg,
+    borderRadius: 12,
+    height: 48,
+    paddingHorizontal: Spacing.three,
+    fontSize: 15,
+    color: Brand.text,
+    ...({ outlineStyle: "none" } as object),
+  },
+  dialogError: {
+    color: "#C0392B",
+    fontSize: 12,
+  },
+  dialogButtons: {
+    flexDirection: "row",
+    gap: Spacing.two,
+    marginTop: Spacing.three,
+  },
+  dialogButton: {
+    flex: 1,
+    height: 46,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  cancelButton: {
+    backgroundColor: Brand.inputBg,
+  },
+  cancelText: {
+    color: Brand.text,
+    fontWeight: "600",
+    fontSize: 14,
+  },
+  confirmRed: {
+    backgroundColor: Brand.primary,
+  },
+  confirmGreen: {
+    backgroundColor: Brand.success,
+  },
+  confirmText: {
+    color: Brand.primaryText,
+    fontWeight: "700",
+    fontSize: 14,
   },
 });

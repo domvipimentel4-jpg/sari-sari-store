@@ -14,11 +14,13 @@ export type ProfileData = {
 };
 
 export async function getProfileData(): Promise<ProfileData> {
-  const account = await getCurrentAccount();
-
-  const items = await loadList<{ stock: number }>("items");
-  const customers = await loadList<{ balance: number }>("customers");
-  const sales = await loadList<{ amount: number; date: string }>("sales");
+  // Ask for everything at the same time instead of one after another
+  const [account, items, customers, sales] = await Promise.all([
+    getCurrentAccount(),
+    loadList<{ stock: number }>("items"),
+    loadList<{ balance: number }>("customers"),
+    loadList<{ amount: number; date: string }>("sales"),
+  ]);
 
   const today = new Date().toDateString();
   const todaySales = sales.filter((s) => s.date === today);
